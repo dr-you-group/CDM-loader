@@ -7,10 +7,13 @@
 -- Optional psql booleans (all default to true):
 --   -v load_mimiciv=false
 --   -v load_synpuf=false
+--   -v load_ehrshot=false
 --   -v analyze_after_load=false
 --
 -- The downloader has already verified each CSV header against its ordered
--- *_column.csv manifest. Explicit column lists below preserve that contract.
+-- *_column.csv manifest or ehrshot_headers.tsv. Explicit column lists below
+-- preserve that contract. EHRSHOT uses HEADER true because its CSV headers
+-- capitalize DATE/DATETIME while the CDM columns retain lowercase names.
 
 \if :{?data_dir}
 \else
@@ -25,6 +28,10 @@
 \if :{?load_synpuf}
 \else
   \set load_synpuf true
+\endif
+\if :{?load_ehrshot}
+\else
+  \set load_ehrshot true
 \endif
 \if :{?analyze_after_load}
 \else
@@ -182,6 +189,48 @@ SELECT NOT (
   \echo 'ERROR: synpuf is not empty. Load into a newly created CDM schema.'
   DO $$ BEGIN RAISE EXCEPTION 'load_data.sql preflight failed'; END $$;
 \endif
+\endif
+
+\if :load_ehrshot
+SELECT (
+  (SELECT count(*) FROM information_schema.tables
+   WHERE table_schema = 'ehrshot' AND table_type = 'BASE TABLE') = 37
+  AND
+  (SELECT count(*) FROM information_schema.columns
+   WHERE table_schema = 'ehrshot') = 396
+  AND
+  (SELECT count(*) FROM information_schema.columns
+   WHERE table_schema = 'ehrshot' AND is_nullable = 'NO') = 164
+  AND
+  (SELECT count(*) FROM information_schema.columns
+   WHERE table_schema = 'ehrshot' AND data_type = 'bigint') = 0
+  AND
+  (SELECT count(*)
+   FROM pg_catalog.pg_constraint c
+   JOIN pg_catalog.pg_namespace n ON n.oid = c.connamespace
+   WHERE n.nspname = 'ehrshot' AND c.contype IN ('p', 'f')) = 0
+) AS ehrshot_base_ok
+\gset
+\if :ehrshot_base_ok
+\else
+  \echo 'ERROR: ehrshot must be the untouched unkeyed 37-table CDM 5.3 base.'
+  DO $$ BEGIN RAISE EXCEPTION 'load_data.sql preflight failed'; END $$;
+\endif
+DO $$
+DECLARE
+  table_name text;
+  contains_rows boolean;
+BEGIN
+  FOR table_name IN
+    SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname = 'ehrshot'
+  LOOP
+    EXECUTE format('SELECT EXISTS (SELECT 1 FROM %I.%I)', 'ehrshot', table_name)
+      INTO contains_rows;
+    IF contains_rows THEN
+      RAISE EXCEPTION 'ehrshot.% is not empty; use a new CDM schema', table_name;
+    END IF;
+  END LOOP;
+END $$;
 \endif
 
 -- Apply the audited reference-server deviations atomically before any COPY.
@@ -342,6 +391,76 @@ CREATE TABLE "synpuf"."dqdashboard_results" (
 );
 \endif
 
+\if :load_ehrshot
+-- EHRSHOT declares CDM v5.3.1. Its source uses extra provenance fields,
+-- 64-bit event identifiers, and strings longer than stock CDM varchar limits.
+-- Keep standard CDM names lowercase; headers are verified before COPY.
+DO $$
+DECLARE
+  column_record record;
+BEGIN
+  FOR column_record IN
+    SELECT c.relname AS table_name, a.attname AS column_name,
+           a.atttypid AS type_oid
+    FROM pg_catalog.pg_namespace n
+    JOIN pg_catalog.pg_class c ON c.relnamespace = n.oid
+    JOIN pg_catalog.pg_attribute a ON a.attrelid = c.oid
+    WHERE n.nspname = 'ehrshot' AND c.relkind = 'r'
+      AND a.attnum > 0 AND NOT a.attisdropped
+      AND a.atttypid IN ('integer'::regtype, 'character varying'::regtype)
+    ORDER BY c.relname, a.attnum
+  LOOP
+    EXECUTE format('ALTER TABLE %I.%I ALTER COLUMN %I TYPE %s',
+      'ehrshot', column_record.table_name, column_record.column_name,
+      CASE WHEN column_record.type_oid = 'integer'::regtype
+           THEN 'BIGINT' ELSE 'TEXT' END);
+  END LOOP;
+END $$;
+
+-- The export has empty NOTE_TEXT values; retain those rows without replacement.
+ALTER TABLE "ehrshot"."note" ALTER COLUMN "note_text" DROP NOT NULL;
+
+ALTER TABLE "ehrshot"."care_site" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."cdm_source" ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."concept" ADD COLUMN "load_table_id" TEXT, ADD COLUMN "load_row_id" TEXT;
+ALTER TABLE "ehrshot"."concept_ancestor" ADD COLUMN "load_table_id" TEXT, ADD COLUMN "load_row_id" TEXT;
+ALTER TABLE "ehrshot"."concept_class" ADD COLUMN "load_table_id" TEXT, ADD COLUMN "load_row_id" TEXT;
+ALTER TABLE "ehrshot"."concept_relationship" ADD COLUMN "load_table_id" TEXT, ADD COLUMN "load_row_id" TEXT;
+ALTER TABLE "ehrshot"."concept_synonym" ADD COLUMN "load_table_id" TEXT, ADD COLUMN "load_row_id" TEXT;
+ALTER TABLE "ehrshot"."condition_era" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."condition_occurrence" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."death" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT, ADD COLUMN "_death_date_external" TEXT;
+ALTER TABLE "ehrshot"."device_exposure" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."domain" ADD COLUMN "load_table_id" TEXT, ADD COLUMN "load_row_id" TEXT;
+ALTER TABLE "ehrshot"."drug_era" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."drug_exposure" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."drug_strength" ADD COLUMN "load_table_id" TEXT, ADD COLUMN "load_row_id" TEXT;
+ALTER TABLE "ehrshot"."fact_relationship" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."location" ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."measurement" ADD COLUMN "modifier_of_event_id" BIGINT, ADD COLUMN "modifier_of_field_concept_id" BIGINT, ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."metadata" ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."note" ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."observation" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."observation_period" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."payer_plan_period" ADD COLUMN "trace_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."person" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."procedure_occurrence" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."provider" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."relationship" ADD COLUMN "load_table_id" TEXT, ADD COLUMN "load_row_id" TEXT;
+ALTER TABLE "ehrshot"."visit_detail" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."visit_occurrence" ADD COLUMN "trace_id" TEXT, ADD COLUMN "unit_id" TEXT, ADD COLUMN "load_table_id" TEXT;
+ALTER TABLE "ehrshot"."vocabulary" ADD COLUMN "load_table_id" TEXT, ADD COLUMN "load_row_id" TEXT;
+
+-- files.csv is source provenance, outside the 37 standard CDM tables.
+CREATE TABLE "ehrshot"."files" (
+  "file_id" TEXT,
+  "file_name" TEXT,
+  "size" BIGINT,
+  "added_at" TEXT,
+  "md5_hash" TEXT
+);
+\endif
+
 -- Verify the final reference-compatible contract before committing the DDL.
 \if :load_mimiciv
 SELECT (
@@ -383,6 +502,31 @@ SELECT (
 \if :synpuf_contract_ok
 \else
   \echo 'ERROR: SynPUF custom DDL did not produce the audited 39/432/172/2 contract.'
+  DO $$ BEGIN RAISE EXCEPTION 'load_data.sql DDL validation failed'; END $$;
+\endif
+\endif
+
+\if :load_ehrshot
+SELECT (
+  (SELECT count(*) FROM information_schema.tables
+   WHERE table_schema = 'ehrshot' AND table_type = 'BASE TABLE') = 38
+  AND
+  (SELECT count(*) FROM information_schema.columns
+   WHERE table_schema = 'ehrshot') = 479
+  AND
+  (SELECT count(*) FROM information_schema.columns
+   WHERE table_schema = 'ehrshot' AND is_nullable = 'NO') = 163
+  AND
+  (SELECT count(*) FROM information_schema.columns
+   WHERE table_schema = 'ehrshot' AND data_type = 'integer') = 0
+  AND
+  (SELECT count(*) FROM information_schema.columns
+   WHERE table_schema = 'ehrshot' AND data_type = 'character varying') = 0
+) AS ehrshot_contract_ok
+\gset
+\if :ehrshot_contract_ok
+\else
+  \echo 'ERROR: EHRSHOT custom DDL did not produce the 38-table/479-column contract.'
   DO $$ BEGIN RAISE EXCEPTION 'load_data.sql DDL validation failed'; END $$;
 \endif
 \endif
@@ -712,6 +856,142 @@ BEGIN;
 COMMIT;
 \endif
 
+\if :load_ehrshot
+  \echo 'Loading 31 EHRSHOT exports into local schema ehrshot...'
+
+BEGIN;
+\copy "ehrshot"."care_site" ("care_site_id","care_site_name","place_of_service_concept_id","location_id","care_site_source_value","place_of_service_source_value","trace_id","unit_id","load_table_id") FROM 'ehrshot/care_site.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."cdm_source" ("cdm_source_name","cdm_source_abbreviation","cdm_holder","source_description","source_documentation_reference","cdm_etl_reference","source_release_date","cdm_release_date","cdm_version","vocabulary_version","unit_id","load_table_id") FROM 'ehrshot/cdm_source.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."concept" ("concept_id","concept_name","domain_id","vocabulary_id","concept_class_id","standard_concept","concept_code","valid_start_date","valid_end_date","invalid_reason","load_table_id","load_row_id") FROM 'ehrshot/concept.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."concept_ancestor" ("ancestor_concept_id","descendant_concept_id","min_levels_of_separation","max_levels_of_separation","load_table_id","load_row_id") FROM 'ehrshot/concept_ancestor.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."concept_class" ("concept_class_id","concept_class_name","concept_class_concept_id","load_table_id","load_row_id") FROM 'ehrshot/concept_class.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."concept_relationship" ("concept_id_1","concept_id_2","relationship_id","valid_start_date","valid_end_date","invalid_reason","load_table_id","load_row_id") FROM 'ehrshot/concept_relationship.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."concept_synonym" ("concept_id","concept_synonym_name","language_concept_id","load_table_id","load_row_id") FROM 'ehrshot/concept_synonym.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."condition_era" ("condition_era_id","person_id","condition_concept_id","condition_era_start_date","condition_era_end_date","condition_occurrence_count","trace_id","unit_id","load_table_id") FROM 'ehrshot/condition_era.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."condition_occurrence" ("condition_occurrence_id","person_id","condition_concept_id","condition_start_date","condition_start_datetime","condition_end_date","condition_end_datetime","condition_type_concept_id","stop_reason","provider_id","visit_occurrence_id","visit_detail_id","condition_source_value","condition_source_concept_id","condition_status_source_value","condition_status_concept_id","trace_id","unit_id","load_table_id") FROM 'ehrshot/condition_occurrence.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."death" ("person_id","death_date","death_datetime","death_type_concept_id","cause_concept_id","cause_source_value","cause_source_concept_id","trace_id","unit_id","load_table_id","_death_date_external") FROM 'ehrshot/death.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."device_exposure" ("device_exposure_id","person_id","device_concept_id","device_exposure_start_date","device_exposure_start_datetime","device_exposure_end_date","device_exposure_end_datetime","device_type_concept_id","unique_device_id","quantity","provider_id","visit_occurrence_id","visit_detail_id","device_source_value","device_source_concept_id","trace_id","unit_id","load_table_id") FROM 'ehrshot/device_exposure.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."domain" ("domain_id","domain_name","domain_concept_id","load_table_id","load_row_id") FROM 'ehrshot/domain.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."drug_era" ("drug_era_id","person_id","drug_concept_id","drug_era_start_date","drug_era_end_date","drug_exposure_count","gap_days","trace_id","unit_id","load_table_id") FROM 'ehrshot/drug_era.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."drug_exposure" ("drug_exposure_id","person_id","drug_concept_id","drug_exposure_start_date","drug_exposure_start_datetime","drug_exposure_end_date","drug_exposure_end_datetime","verbatim_end_date","drug_type_concept_id","stop_reason","refills","quantity","days_supply","route_concept_id","lot_number","provider_id","visit_occurrence_id","visit_detail_id","drug_source_value","drug_source_concept_id","route_source_value","dose_unit_source_value","trace_id","unit_id","load_table_id","sig") FROM 'ehrshot/drug_exposure.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."drug_strength" ("drug_concept_id","ingredient_concept_id","amount_value","amount_unit_concept_id","numerator_value","numerator_unit_concept_id","denominator_value","denominator_unit_concept_id","box_size","valid_start_date","valid_end_date","invalid_reason","load_table_id","load_row_id") FROM 'ehrshot/drug_strength.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."fact_relationship" ("domain_concept_id_1","fact_id_1","domain_concept_id_2","fact_id_2","relationship_concept_id","trace_id","unit_id","load_table_id") FROM 'ehrshot/fact_relationship.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."files" ("file_id","file_name","size","added_at","md5_hash") FROM 'ehrshot/files.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."location" ("location_id","address_1","address_2","city","state","zip","county","location_source_value","unit_id","load_table_id") FROM 'ehrshot/location.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."measurement" ("measurement_id","person_id","measurement_concept_id","measurement_date","measurement_datetime","measurement_time","measurement_type_concept_id","operator_concept_id","value_as_number","value_as_concept_id","unit_concept_id","range_low","range_high","provider_id","visit_occurrence_id","visit_detail_id","measurement_source_value","measurement_source_concept_id","unit_source_value","modifier_of_event_id","modifier_of_field_concept_id","trace_id","unit_id","load_table_id","value_source_value") FROM 'ehrshot/measurement.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."metadata" ("metadata_concept_id","metadata_type_concept_id","name","value_as_string","value_as_concept_id","metadata_date","metadata_datetime","unit_id","load_table_id") FROM 'ehrshot/metadata.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."note" ("note_id","person_id","note_date","note_datetime","note_type_concept_id","note_class_concept_id","note_title","encoding_concept_id","language_concept_id","provider_id","visit_occurrence_id","visit_detail_id","note_source_value","load_table_id","note_text") FROM 'ehrshot/note.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."observation" ("observation_id","person_id","observation_concept_id","observation_date","observation_datetime","observation_type_concept_id","value_as_number","value_as_concept_id","qualifier_concept_id","unit_concept_id","provider_id","visit_occurrence_id","visit_detail_id","observation_source_concept_id","unit_source_value","qualifier_source_value","trace_id","unit_id","load_table_id","value_as_string","observation_source_value") FROM 'ehrshot/observation.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."observation_period" ("observation_period_id","person_id","observation_period_start_date","observation_period_end_date","period_type_concept_id","trace_id","unit_id","load_table_id") FROM 'ehrshot/observation_period.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."payer_plan_period" ("payer_plan_period_id","person_id","payer_plan_period_start_date","payer_plan_period_end_date","payer_concept_id","payer_source_value","payer_source_concept_id","plan_concept_id","plan_source_value","plan_source_concept_id","sponsor_concept_id","sponsor_source_value","sponsor_source_concept_id","family_source_value","stop_reason_concept_id","stop_reason_source_value","stop_reason_source_concept_id","trace_id","load_table_id") FROM 'ehrshot/payer_plan_period.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."person" ("person_id","gender_concept_id","year_of_birth","month_of_birth","day_of_birth","birth_datetime","race_concept_id","ethnicity_concept_id","location_id","provider_id","care_site_id","person_source_value","gender_source_value","gender_source_concept_id","race_source_value","race_source_concept_id","ethnicity_source_value","ethnicity_source_concept_id","trace_id","unit_id","load_table_id") FROM 'ehrshot/person.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."procedure_occurrence" ("procedure_occurrence_id","person_id","procedure_concept_id","procedure_date","procedure_datetime","procedure_type_concept_id","modifier_concept_id","quantity","provider_id","visit_occurrence_id","visit_detail_id","procedure_source_value","procedure_source_concept_id","modifier_source_value","trace_id","unit_id","load_table_id") FROM 'ehrshot/procedure_occurrence.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."provider" ("provider_id","provider_name","npi","dea","specialty_concept_id","care_site_id","year_of_birth","gender_concept_id","provider_source_value","specialty_source_value","specialty_source_concept_id","gender_source_value","gender_source_concept_id","trace_id","unit_id","load_table_id") FROM 'ehrshot/provider.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."relationship" ("relationship_id","relationship_name","is_hierarchical","defines_ancestry","reverse_relationship_id","relationship_concept_id","load_table_id","load_row_id") FROM 'ehrshot/relationship.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."visit_detail" ("visit_detail_id","person_id","visit_detail_concept_id","visit_detail_start_date","visit_detail_start_datetime","visit_detail_end_date","visit_detail_end_datetime","visit_detail_type_concept_id","provider_id","care_site_id","admitting_source_concept_id","discharge_to_concept_id","preceding_visit_detail_id","visit_detail_source_value","visit_detail_source_concept_id","admitting_source_value","visit_occurrence_id","trace_id","unit_id","load_table_id") FROM 'ehrshot/visit_detail.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."visit_occurrence" ("visit_occurrence_id","person_id","visit_concept_id","visit_start_date","visit_start_datetime","visit_end_date","visit_end_datetime","visit_type_concept_id","provider_id","care_site_id","visit_source_value","visit_source_concept_id","admitting_source_concept_id","admitting_source_value","discharge_to_concept_id","discharge_to_source_value","preceding_visit_occurrence_id","trace_id","unit_id","load_table_id") FROM 'ehrshot/visit_occurrence.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+BEGIN;
+\copy "ehrshot"."vocabulary" ("vocabulary_id","vocabulary_name","vocabulary_reference","vocabulary_version","vocabulary_concept_id","load_table_id","load_row_id") FROM 'ehrshot/vocabulary.csv' WITH (FORMAT csv, HEADER true, DELIMITER ',', QUOTE '"', ESCAPE '"', NULL '', ENCODING 'UTF8')
+COMMIT;
+
+SELECT EXISTS (SELECT 1 FROM "ehrshot"."cdm_source" WHERE "cdm_version" = 'v5.3.1') AS ehrshot_version_ok
+\gset
+\if :ehrshot_version_ok
+\else
+  \echo 'ERROR: EHRSHOT cdm_source did not declare v5.3.1.'
+  DO $$ BEGIN RAISE EXCEPTION 'EHRSHOT CDM version validation failed'; END $$;
+\endif
+\endif
+
 \if :analyze_after_load
   \echo 'Updating PostgreSQL planner statistics...'
   \if :load_mimiciv
@@ -725,6 +1005,13 @@ ORDER BY tablename
 SELECT format('ANALYZE %I.%I;', schemaname, tablename)
 FROM pg_catalog.pg_tables
 WHERE schemaname = 'synpuf'
+ORDER BY tablename
+\gexec
+  \endif
+  \if :load_ehrshot
+SELECT format('ANALYZE %I.%I;', schemaname, tablename)
+FROM pg_catalog.pg_tables
+WHERE schemaname = 'ehrshot'
 ORDER BY tablename
 \gexec
   \endif

@@ -22,7 +22,13 @@ cd <- DatabaseConnector::createConnectionDetails(
 
 CommonDataModel::listSupportedVersions()
 
-for (schema in c("mimiciv", "synpuf")) {
+schemas <- commandArgs(trailingOnly = TRUE)
+if (length(schemas) == 0L) schemas <- c("mimiciv", "synpuf", "ehrshot")
+if (any(!schemas %in% c("mimiciv", "synpuf", "ehrshot"))) {
+  stop("Schemas must be mimiciv, synpuf, or ehrshot")
+}
+
+for (schema in unique(schemas)) {
   CommonDataModel::executeDdl(
     connectionDetails = cd,
     cdmVersion = "5.3",

@@ -6,6 +6,7 @@ bucket="gs://younwoo-bucket"
 destination="${PWD}/data"
 selection="all"
 dry_run=false
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 
 usage() {
   cat <<'USAGE'
@@ -16,7 +17,7 @@ Download the materialized OMOP exports and their ordered column manifests.
 Options:
   --dest DIR       Local data root (default: ./data)
   --bucket URI     GCS bucket (default: gs://younwoo-bucket)
-  --only NAME      all, mimiciv, or synpuf (comma-separated values accepted)
+  --only NAME      all, mimiciv, synpuf, or ehrshot (comma-separated values accepted)
   --dry-run        Show the selected prefixes and gsutil operations only
   -h, --help       Show this help
 
@@ -25,8 +26,9 @@ The live bucket contains newer exports than the supplied DOCX screenshot:
   mimiciv_column/   40 ordered column manifests
   synpuf23/         39 headered OMOP CSV files
   synpuf23_column/  39 ordered column manifests
+  ehrshot/          31 headered CSV files plus Files_files.zip
 
-The default download is about 288.3 GiB before PostgreSQL storage and WAL.
+The default download is about 309.6 GiB before PostgreSQL storage and WAL.
 Downloads are resumable because gsutil rsync is used without deletion.
 USAGE
 }
@@ -87,6 +89,7 @@ for item in "${requested[@]}"; do
       add_prefix mimiciv_column
       add_prefix synpuf23
       add_prefix synpuf23_column
+      add_prefix ehrshot
       ;;
     mimiciv)
       add_prefix mimiciv
@@ -95,6 +98,9 @@ for item in "${requested[@]}"; do
     synpuf|synpuf23)
       add_prefix synpuf23
       add_prefix synpuf23_column
+      ;;
+    ehrshot)
+      add_prefix ehrshot
       ;;
     '')
       die "empty entry in --only"
@@ -192,12 +198,52 @@ validate_export() {
   printf '  %s: %d table/header contracts verified.\n' "$data_prefix" "$expected_tables"
 }
 
+validate_ehrshot() {
+  local data_path="${destination}/ehrshot"
+  local manifest_path="${script_dir}/ehrshot_headers.tsv"
+  local filename expected_header actual_header data_file
+  local -a data_files
+
+  [[ -s $manifest_path ]] || die "missing EHRSHOT header manifest: ${manifest_path}"
+  [[ -d $data_path ]] || die "missing EHRSHOT data directory: ${data_path}"
+  [[ -s ${data_path}/Files_files.zip ]] || die "missing EHRSHOT Files_files.zip"
+
+  shopt -s nullglob
+  data_files=("${data_path}"/*.csv)
+  shopt -u nullglob
+  ((${#data_files[@]} == 31)) || die \
+    "ehrshot: expected 31 CSV files, found ${#data_files[@]}"
+  (($(wc -l < "$manifest_path") == 31)) || die \
+    "ehrshot: expected 31 checked header definitions"
+
+  while IFS=$'\t' read -r filename expected_header; do
+    [[ $filename == *.csv && -n $expected_header ]] || die \
+      "invalid EHRSHOT manifest entry: ${filename}"
+    data_file="${data_path}/${filename}"
+    [[ -s $data_file ]] || die "missing or empty EHRSHOT file: ${filename}"
+    actual_header=$(LC_ALL=C head -n 1 "$data_file" | tr -d '\r"')
+    [[ $actual_header == "$expected_header" ]] || die \
+      "header mismatch for ehrshot/${filename}"
+  done < "$manifest_path"
+
+  for data_file in "${data_files[@]}"; do
+    filename=${data_file##*/}
+    awk -F '\t' -v name="$filename" '$1 == name {found = 1} END {exit !found}' \
+      "$manifest_path" || die "no header definition for ehrshot/${filename}"
+  done
+
+  printf '  ehrshot: 31 table/header contracts and Files_files.zip verified.\n'
+}
+
 printf '\nValidating every downloaded CSV against its ordered column manifest...\n'
 if contains_prefix mimiciv; then
   validate_export mimiciv mimiciv_column 40
 fi
 if contains_prefix synpuf23; then
   validate_export synpuf23 synpuf23_column 39
+fi
+if contains_prefix ehrshot; then
+  validate_ehrshot
 fi
 
 printf '\nDownload and layout validation completed successfully.\n'
